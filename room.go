@@ -1,53 +1,56 @@
-package main
+package douyin
 
 import (
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
 	"time"
 
-	dyproto "github.com/XiaoMiku01/douyin-live-go/protobuf"
-	"github.com/golang/protobuf/proto"
 	"github.com/gorilla/websocket"
+	"github.com/pkg/errors"
+	dyproto "github.com/zboyco/douyin-live-go/protobuf"
+	"google.golang.org/protobuf/proto"
 )
 
 type Room struct {
-	// 房间地址
-	Url string
-
-	Ttwid string
-
+	Url       string // 房间地址
+	Ttwid     string
 	RoomStore string
-
-	RoomId string
-
+	RoomId    string
 	RoomTitle string
-
 	wsConnect *websocket.Conn
+
+	fns []func(message any)
 }
 
-func NewRoom(u string) (*Room, error) {
+func NewRoom(roomID string, handles ...func(message any)) (*Room, error) {
 	h := map[string]string{
 		"accept":     "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
 		"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36",
 		"cookie":     "__ac_nonce=0638733a400869171be51",
 	}
-	req, err := http.NewRequest("GET", u, nil)
+	roomUrl := fmt.Sprintf("https://live.douyin.com/%s", roomID)
+	req, err := http.NewRequest("GET", roomUrl, nil)
 	if err != nil {
-		log.Println(err)
+		log.Printf("NewRequest failed, error: %v", err)
 		return nil, err
 	}
 	for k, v := range h {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{}
+	client := &http.Client{
+		Timeout: time.Second * 10,
+	}
+	log.Println("[系统] 开始获取房间信息...")
 	res, err := client.Do(req)
 	if err != nil {
-		log.Println(err)
+		log.Printf("[系统] 获取房间信息失败, 错误信息: %v", err)
 		return nil, err
 	}
 	defer res.Body.Close()
@@ -61,21 +64,24 @@ func NewRoom(u string) (*Room, error) {
 	}
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		log.Println(err)
+		log.Printf("[系统] 读取房间信息失败, error: %v", err)
 		return nil, err
 	}
+	log.Println("[系统] 获取房间信息成功")
 	resText := string(body)
 	re := regexp.MustCompile(`roomId\\":\\"(\d+)\\"`)
 	match := re.FindStringSubmatch(resText)
 	if match == nil || len(match) < 2 {
-		log.Println("No match found")
+		err = errors.New("No match found")
+		slog.Error(err.Error())
 		return nil, err
 	}
 	liveRoomId := match[1]
 	return &Room{
-		Url:    u,
+		Url:    roomUrl,
 		Ttwid:  ttwid,
 		RoomId: liveRoomId,
+		fns:    handles,
 	}, nil
 }
 
@@ -86,11 +92,13 @@ func (r *Room) Connect() error {
 	h.Set("cookie", "ttwid="+r.Ttwid)
 	h.Set("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36")
 
+	log.Println("[系统] 开始连接直播数据...")
 	wsConn, wsResp, err := websocket.DefaultDialer.Dial(wsUrl, h)
 	if err != nil {
+		log.Println("[系统] 连接失败, 错误信息:", err)
 		return err
 	}
-	log.Println(wsResp.StatusCode)
+	log.Printf("[系统] 连接成功,状态码:%d", wsResp.StatusCode)
 	r.wsConnect = wsConn
 	go r.read()
 	go r.send()
@@ -116,13 +124,14 @@ func (r *Room) read() {
 		for _, msg := range payloadPackage.MessagesList {
 			switch msg.Method {
 			case "WebcastChatMessage":
-				parseChatMsg(msg.Payload)
+				r.parseChatMsg(msg.Payload)
 			case "WebcastGiftMessage":
-				parseGiftMsg(msg.Payload)
+				r.parseGiftMsg(msg.Payload)
 			case "WebcastLikeMessage":
-				parseLikeMsg(msg.Payload)
+				r.parseLikeMsg(msg.Payload)
 			case "WebcastMemberMessage":
-				parseEnterMsg(msg.Payload)
+				r.parseEnterMsg(msg.Payload)
+			default:
 			}
 		}
 	}
@@ -138,7 +147,7 @@ func (r *Room) send() {
 		if err != nil {
 			panic(err.Error())
 		}
-		// log.Println("发送心跳")
+		log.Println("[系统] 发送 ping 包")
 		time.Sleep(time.Second * 10)
 	}
 }
@@ -153,7 +162,7 @@ func (r *Room) sendAck(logId uint64, iExt string) {
 	if err != nil {
 		panic(err.Error())
 	}
-	// log.Println("发送 ack 包")
+	log.Println("[系统] 发送 ack 包")
 }
 
 func degzip(data []byte) ([]byte, error) {
@@ -170,26 +179,38 @@ func degzip(data []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-func parseChatMsg(msg []byte) {
-	var chatMsg dyproto.ChatMessage
-	_ = proto.Unmarshal(msg, &chatMsg)
-	log.Printf("[弹幕] %s : %s\n", chatMsg.User.NickName, chatMsg.Content)
+func (r *Room) parseChatMsg(msg []byte) {
+	chatMsg := &dyproto.ChatMessage{}
+	_ = proto.Unmarshal(msg, chatMsg)
+	// log.Printf("[弹幕] %s : %s", chatMsg.User.NickName, chatMsg.Content)
+	for _, fn := range r.fns {
+		go fn(chatMsg)
+	}
 }
 
-func parseGiftMsg(msg []byte) {
-	var giftMsg dyproto.GiftMessage
-	_ = proto.Unmarshal(msg, &giftMsg)
-	log.Printf("[礼物] %s : %s * %d \n", giftMsg.User.NickName, giftMsg.Gift.Name, giftMsg.ComboCount)
+func (r *Room) parseGiftMsg(msg []byte) {
+	giftMsg := &dyproto.GiftMessage{}
+	_ = proto.Unmarshal(msg, giftMsg)
+	// log.Printf("[礼物] %s : %s * %d \n", giftMsg.User.NickName, giftMsg.Gift.Name, giftMsg.ComboCount)
+	for _, fn := range r.fns {
+		go fn(giftMsg)
+	}
 }
 
-func parseLikeMsg(msg []byte) {
-	var likeMsg dyproto.LikeMessage
-	_ = proto.Unmarshal(msg, &likeMsg)
-	log.Printf("[点赞] %s 点赞 * %d \n", likeMsg.User.NickName, likeMsg.Count)
+func (r *Room) parseLikeMsg(msg []byte) {
+	likeMsg := &dyproto.LikeMessage{}
+	_ = proto.Unmarshal(msg, likeMsg)
+	// log.Printf("[点赞] %s 点赞 * %d \n", likeMsg.User.NickName, likeMsg.Count)
+	for _, fn := range r.fns {
+		go fn(likeMsg)
+	}
 }
 
-func parseEnterMsg(msg []byte) {
-	var enterMsg dyproto.MemberMessage
-	_ = proto.Unmarshal(msg, &enterMsg)
-	log.Printf("[入场] %s 直播间\n", enterMsg.User.NickName)
+func (r *Room) parseEnterMsg(msg []byte) {
+	enterMsg := &dyproto.MemberMessage{}
+	_ = proto.Unmarshal(msg, enterMsg)
+	// log.Printf("[入场] %s 直播间\n", enterMsg.User.NickName)
+	for _, fn := range r.fns {
+		go fn(enterMsg)
+	}
 }
