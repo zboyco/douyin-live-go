@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -100,8 +101,17 @@ func (r *Room) Connect() error {
 	}
 	log.Printf("[系统] 连接成功,状态码:%d", wsResp.StatusCode)
 	r.wsConnect = wsConn
-	go r.read()
-	go r.send()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		r.read()
+	}()
+	go func() {
+		defer wg.Done()
+		r.send()
+	}()
+	wg.Wait()
 	return nil
 }
 
