@@ -32,9 +32,8 @@ type Room struct {
 
 func NewRoom(roomID string, handles ...func(message any)) (*Room, error) {
 	h := map[string]string{
-		"accept":     "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
 		"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36",
-		"cookie":     "__ac_nonce=0638733a400869171be51",
+		"cookie":     "odin_tt=5358a98f55c32065cdfd667f8e87f40fc846f4852cfe8e29ec0cee8bc5b89672315a9b453c8d8cf8f72988bb455cdf75f7ecd1cf70e20776178974236d95a03bbb2d51f2ef8c511e6c74efdcb0b65b20;  __ac_nonce=0638733a400869171be51;",
 	}
 	roomUrl := fmt.Sprintf("https://live.douyin.com/%s", roomID)
 	req, err := http.NewRequest("GET", roomUrl, nil)
@@ -73,7 +72,7 @@ func NewRoom(roomID string, handles ...func(message any)) (*Room, error) {
 	re := regexp.MustCompile(`roomId\\":\\"(\d+)\\"`)
 	match := re.FindStringSubmatch(resText)
 	if match == nil || len(match) < 2 {
-		err = errors.New("No match found")
+		err = errors.New("直播间ID获取失败, No match found")
 		slog.Error(err.Error())
 		return nil, err
 	}
